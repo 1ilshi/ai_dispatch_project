@@ -1,4 +1,3 @@
-# engine.py
 import base64
 import email
 import imaplib
@@ -12,6 +11,7 @@ import re
 from contextlib import closing
 from email.header import decode_header
 from typing import List, Dict, Any
+from email.utils import parsedate_to_datetime  # <-- ADDED DATE IMPORT
 
 import pandas as pd
 import requests
@@ -45,7 +45,9 @@ def init_db():
             conn.execute("""
                          CREATE TABLE IF NOT EXISTS triaged_tickets (
                                                                         email_id TEXT PRIMARY KEY,
+                                                                        email_date DATETIME,  -- <-- ADDED COLUMN
                                                                         payload_type TEXT,
+                                                                        ticket_type TEXT,
                                                                         subject TEXT,
                                                                         cc_list TEXT,
                                                                         actionable TEXT,
@@ -65,19 +67,35 @@ def load_relational_maps(filepath: str = MATRIX_FILE) -> tuple:
         queue_df = pd.read_excel(filepath, sheet_name="Queue_Map")
         roster_df = pd.read_excel(filepath, sheet_name="Staff_Roster")
 
-        # 1. Markdown string of skills for Mistral to read
+        # 📊 DYNAMIC TICKET TYPE SHEET LOADER
+        try:
+            types_df = pd.read_excel(filepath, sheet_name="Ticket_Types", header=None)
+            if str(types_df.iloc[0, 0]).strip().lower() in ["ticket_type", "ticket type", "type"]:
+                types_df = types_df.iloc[1:].reset_index(drop=True)
+
+            types_df.columns = ["Ticket_Type", "Description"]
+            ticket_types_markdown = types_df.to_markdown(index=False)
+            allowed_types_list = "\n".join([f'   - "{str(t).strip()}"' for t in types_df["Ticket_Type"].dropna()])
+        except Exception as e:
+            logger.warning(f"Could not load 'Ticket_Types' sheet correctly. Error: {e}")
+            ticket_types_markdown = (
+                "| Ticket_Type | Description |\n"
+                "|:---|:---\n"
+                "| Problem Solving | Troubleshooting technical bugs, service disruptions, or broken systems |\n"
+                "| New Installation | Requests for setting up new software, licenses, accounts, or equipment |\n"
+                "| Provide Guide/Advise | General how-to questions, guidelines, and documentation requests |\n"
+                "| Special Request | Custom configurations or out-of-scope requests requiring approval |"
+            )
+            allowed_types_list = '   - "Problem Solving"\n   - "New Installation"\n   - "Provide Guide/Advise"\n   - "Special Request"'
+
         skills_markdown = skills_df.to_markdown(index=False)
-
-        # 2. Map: Unique_Skill -> Queue (e.g., 'SIS' -> 'Application')
         skill_to_queue = dict(zip(queue_df['Unique_Skill'], queue_df['Queue']))
-
-        # 3. Map: Unique_Skill -> List of Owners (e.g., 'SIS' -> ['Supalak', 'Tony'])
         skill_to_owners = roster_df.groupby('Unique_Skill')['Owner'].apply(lambda x: list(x.astype(str))).to_dict()
 
-        return skills_markdown, skill_to_queue, skill_to_owners
+        return skills_markdown, skill_to_queue, skill_to_owners, ticket_types_markdown, allowed_types_list
     except Exception as e:
         logger.error(f"Error loading relational maps: {e}")
-        return None, {}, {}
+        return None, {}, {}, "", ""
 
 def load_or_init_workloads(filepath: str = MATRIX_FILE) -> dict:
     if os.path.exists(WORKLOAD_FILE):
@@ -114,12 +132,13 @@ def save_triaged_ticket(ticket_data: Dict[str, Any]):
         with conn:
             conn.execute("""
                 INSERT OR REPLACE INTO triaged_tickets 
-                (email_id, payload_type, subject, cc_list, actionable, assigned_owner, target_queue, responsibility, evaluation)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (email_id, email_date, payload_type, ticket_type, subject, cc_list, actionable, assigned_owner, target_queue, responsibility, evaluation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                ticket_data["email_id"], ticket_data["payload_type"], ticket_data["subject"],
-                ticket_data["cc_list"], ticket_data["actionable"], ticket_data["assigned_owner"],
-                ticket_data["target_queue"], ticket_data["responsibility"], ticket_data["evaluation"]
+                ticket_data["email_id"], ticket_data["email_date"], ticket_data["payload_type"], ticket_data["ticket_type"],
+                ticket_data["subject"], ticket_data["cc_list"], ticket_data["actionable"],
+                ticket_data["assigned_owner"], ticket_data["target_queue"], ticket_data["responsibility"],
+                ticket_data["evaluation"]
             ))
 
 def fetch_unread_emails() -> List[Dict[str, Any]]:
@@ -146,6 +165,16 @@ def fetch_unread_emails() -> List[Dict[str, Any]]:
                         subject, encoding = decode_header(msg.get("Subject", ""))[0]
                         if isinstance(subject, bytes): subject = subject.decode(encoding if encoding else "utf-8")
 
+                        # --- ADDED: EXTRACT DATE ---
+                        date_header = msg.get("Date")
+                        email_date = time.strftime("%Y-%m-%d %H:%M:%S")
+                        if date_header:
+                            try:
+                                email_date = parsedate_to_datetime(date_header).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception as e:
+                                logger.warning(f"Could not parse email date: {e}")
+                        # ---------------------------
+
                         cc_header = msg.get("Cc", "")
                         cc_list = ""
                         if cc_header:
@@ -164,7 +193,8 @@ def fetch_unread_emails() -> List[Dict[str, Any]]:
                             body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
 
                         unprocessed_emails.append({
-                            "email_id": email_id_str, "subject": subject if subject else "(No Subject)",
+                            "email_id": email_id_str, "email_date": email_date,  # <-- ADDED DATE
+                            "subject": subject if subject else "(No Subject)",
                             "cc": cc_list, "body": body[:1500], "images": images_b64
                         })
     except Exception as e:
@@ -182,35 +212,78 @@ def process_images_with_llava(base64_images: List[str]) -> str:
 
 def extract_json_from_deepseek(raw_response: str) -> dict:
     cleaned_text = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
-    match = re.search(r'\{.*}', cleaned_text, re.DOTALL)
+    match = re.search(r'\{.*?}', cleaned_text, re.DOTALL)
     if match:
-        try: return json.loads(match.group(0))
-        except json.JSONDecodeError: pass
-    return {}
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as e:
+            logger.error(f"DeepSeek JSON Parse Error: {e}")
+            pass
+    return {"is_valid_request": False, "reason": "Gatekeeper formatting failure."}
 
 def stage1_gatekeeper(subject: str, body: str) -> dict:
     logger.info("STAGE 1: Gatekeeper Analysis (DeepSeek-R1)...")
-    prompt = STAGE1_GATEKEEPER_PROMPT.format(subject=subject, body=body[:1000])
-    payload = {"model": OLLAMA_STAGE1_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}}
+    prompt = (STAGE1_GATEKEEPER_PROMPT
+              .replace("{subject}", str(subject))
+              .replace("{body}", str(body[:1000])))
+
+    payload = {
+        "model": OLLAMA_STAGE1_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.0}
+    }
+
     try:
         res = requests.post(OLLAMA_API_URL, json=payload).json()["response"]
         return extract_json_from_deepseek(res)
     except Exception as e:
+        logger.error(f"Stage 1 Error: {e}")
         return {"is_valid_request": False, "reason": "Engine Failure"}
 
-def stage2_skill_router(subject: str, body: str, skill_dict: str) -> str:
+def stage2_skill_router(subject: str, body: str, skill_dict: str, types_markdown: str, allowed_types_list: str) -> tuple:
+    """Classifies ticket type and assigns the handling responsibility."""
     logger.info("STAGE 2: Skill Classification (llama3.1)...")
-    prompt = STAGE2_SKILL_ROUTER_PROMPT.format(skill_dictionary=skill_dict, subject=subject, body=body[:1000])
-    payload = {"model": OLLAMA_STAGE2_MODEL, "prompt": prompt, "format": "json", "stream": False, "options": {"temperature": 0.0}}
+
+    prompt = (STAGE2_SKILL_ROUTER_PROMPT
+              .replace("{skill_dictionary}", str(skill_dict))
+              .replace("{ticket_types_dictionary}", str(types_markdown))
+              .replace("{allowed_ticket_types}", str(allowed_types_list))
+              .replace("{subject}", str(subject))
+              .replace("{body}", str(body[:1000])))
+
+    payload = {
+        "model": OLLAMA_STAGE2_MODEL,
+        "prompt": prompt,
+        "format": "json",
+        "stream": False,
+        "options": {
+            "temperature": 0.0,
+            "num_ctx": 16384
+        }
+    }
+
     try:
         res = requests.post(OLLAMA_API_URL, json=payload).json()["response"]
-        return json.loads(res).get("responsibility", "Unassigned")
+
+        match = re.search(r'\{.*?}', res, re.DOTALL)
+        raw_json = match.group(0) if match else res.strip()
+        parsed_json = json.loads(raw_json)
+
+        clean_json = {str(k).strip(): str(v).strip() for k, v in parsed_json.items()}
+
+        responsibility = clean_json.get("responsibility", "Unassigned")
+        ticket_type = clean_json.get("ticket_type", "Problem Solving")
+        resp_reason = clean_json.get("responsibility_reason", "No reason provided.")
+
+        return responsibility, ticket_type, resp_reason
     except Exception as e:
-        return "Unassigned"
+        logger.error(f"Stage 2 Routing Error: {e}")
+        return "Unassigned", "Problem Solving", "Error generating reason."
 
 def run_dispatch_cycle():
     logger.info("Starting dispatch cycle...")
-    skills_markdown, skill_to_queue, skill_to_owners = load_relational_maps()
+    skills_markdown, skill_to_queue, skill_to_owners, types_markdown, allowed_types_list = load_relational_maps()
 
     if not skill_to_queue:
         logger.error("Failed to load Excel data. Aborting.")
@@ -222,33 +295,44 @@ def run_dispatch_cycle():
     for idx, em in enumerate(unprocessed, 1):
         logger.info(f"Processing ticket [{idx}/{len(unprocessed)}]: '{em['subject'][:30]}'")
 
-        vision_insights = process_images_with_llava(em["images"])
-
-        # STAGE 1: Check if valid
+        # STAGE 1: Gatekeeper Check
         gatekeeper = stage1_gatekeeper(em["subject"], em["body"])
         is_valid = gatekeeper.get("is_valid_request", False)
         gatekeeper_reason = gatekeeper.get("reason", "N/A")
 
-        responsibility = "Unassigned"
-        queue = "Unassigned"
+        # Initialize defaults
+        responsibility = "N/A"
+        ticket_type = "N/A"
+        queue = "N/A"
+        assigned_owner = "Unassigned"
+        tournament_logs = f"Ticket skipped by Gatekeeper. Reason: {gatekeeper_reason}"
         candidate_pool = []
 
+        # STAGE 2 & TOURNAMENT: Only perform if actionable
         if is_valid:
-            # STAGE 2: Mistral finds the specific skill
-            # (Note: we inject the vision string into the body dynamically for context if images exist)
+            vision_insights = process_images_with_llava(em["images"])
             full_context = em["body"] + f"\n\n[IMAGE DATA]: {vision_insights}" if em["images"] else em["body"]
-            responsibility = stage2_skill_router(em["subject"], full_context, skills_markdown)
 
-            # PURE PYTHON: STAGE 3 RELATIONAL LOOKUP (Instant, no LLM required)
+            # Analyze Type and Skill
+            responsibility, ticket_type, resp_reason = stage2_skill_router(
+                em["subject"],
+                full_context,
+                skills_markdown,
+                types_markdown,
+                allowed_types_list
+            )
+            # PURE PYTHON: Relational Lookup
             queue = skill_to_queue.get(responsibility, "Unassigned")
             candidate_pool = skill_to_owners.get(responsibility, [])
 
-        # TOURNAMENT LOGIC
-        assigned_owner = "Unassigned"
-        tournament_logs = "N/A"
-
-        if is_valid:
+            # Tournament
             valid_candidates = [str(c).strip() for c in candidate_pool if str(c).strip() not in ["", "Unassigned", "N/A"]]
+            senior_staff = ['Viraphan', 'Harianto']
+            junior_candidates = [c for c in valid_candidates if c not in senior_staff]
+
+            if junior_candidates:
+                valid_candidates = junior_candidates
+
             if valid_candidates:
                 score_cards = [f"{name} ({current_workloads.get(name, 0)} active)" for name in valid_candidates]
                 tournament_logs = f"Eligible Candidates Identified: {', '.join(score_cards)}. "
@@ -259,21 +343,27 @@ def run_dispatch_cycle():
                 tournament_logs += f"🏆 Winner chosen by Python Engine: {assigned_owner} (Score: {min_score})."
             else:
                 tournament_logs = "No valid candidates found in Staff Roster for this skill."
-        else:
-            tournament_logs = f"Ticket skipped by Gatekeeper. Reason: {gatekeeper_reason}"
 
         ai_thinking = (
             f"🛑 **Gatekeeper:** {'Approved' if is_valid else 'Rejected'} ({gatekeeper_reason})\n\n"
-            f"🎯 **Skill Selected by AI:** {responsibility}\n\n"
+            f"🏷️ **Ticket Type:** {ticket_type}\n\n"
+            f"🎯 **Skill Selected by AI:** {responsibility}\n"
+            f"💡 **Reason:** {resp_reason}\n\n"
             f"⚖️ **Python Workload Tournament Result:**\n`{tournament_logs}`"
         )
 
         ticket_packet = {
-            "email_id": em["email_id"], "payload_type": "🖼️ Image+Text" if em["images"] else "📝 Pure Text",
-            "subject": em["subject"], "cc_list": em["cc"] if em["cc"] else "-",
+            "email_id": em["email_id"],
+            "email_date": em["email_date"],  # <-- ADDED DATE TO PACKET
+            "payload_type": "🖼️ Image+Text" if em["images"] else "📝 Pure Text",
+            "ticket_type": ticket_type,
+            "subject": em["subject"],
+            "cc_list": em["cc"] if em["cc"] else "-",
             "actionable": "✅ Yes" if is_valid else "❌ No",
-            "assigned_owner": assigned_owner, "target_queue": queue,
-            "responsibility": responsibility, "evaluation": ai_thinking
+            "assigned_owner": assigned_owner,
+            "target_queue": queue,
+            "responsibility": responsibility,
+            "evaluation": ai_thinking
         }
 
         save_triaged_ticket(ticket_packet)
@@ -282,11 +372,11 @@ def run_dispatch_cycle():
             update_workload(assigned_owner)
             current_workloads[assigned_owner] = current_workloads.get(assigned_owner, 0) + 1
 
-        logger.info(f"Saved: Owner -> {assigned_owner} | Queue -> {queue}")
+        logger.info(f"Saved: Owner -> {assigned_owner} | Queue -> {queue} | Type -> {ticket_type}")
 
 if __name__ == "__main__":
     try:
-        print("🚀 [BOOT] Initializing V3 Relational Dispatch Engine (2-Model Stack)...")
+        print("🚀 [BOOT] Initializing V3 Relational Dispatch Engine (Bulletproof Types)...")
         init_db()
         logger.info("Engine running successfully. Press Ctrl+C to shut down.")
         while True:

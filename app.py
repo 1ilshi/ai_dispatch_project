@@ -3,10 +3,11 @@ import json
 import sqlite3
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 from contextlib import closing
 
 DB_FILE = "tickets.db"
-WORKLOAD_FILE = "workloads.json"  # <-- Hooked up your live tracking file!
+WORKLOAD_FILE = "workloads.json"
 
 def load_triaged_tickets():
     """Reads all historical ticket data stored in SQLite by our background engine."""
@@ -15,24 +16,25 @@ def load_triaged_tickets():
 
     try:
         with closing(sqlite3.connect(DB_FILE)) as conn:
-            # Load the database rows ordered by the latest incoming emails first
+            # UPDATED: Added email_date to the SELECT statement and sorting by it
             df = pd.read_sql_query(
-                "SELECT payload_type, subject, cc_list, actionable, assigned_owner, target_queue, responsibility, evaluation, timestamp FROM triaged_tickets ORDER BY timestamp DESC",
+                "SELECT email_date, payload_type, ticket_type, subject, cc_list, actionable, assigned_owner, target_queue, responsibility, evaluation, timestamp FROM triaged_tickets ORDER BY email_date DESC",
                 conn
             )
-            # Rename database columns to match your original clean dashboard aesthetics
+            # UPDATED: Added Email Arrived At to the column mapping
             df.columns = [
-                "Payload Type", "Subject Line", "CC Field Data", "Actionable?",
+                "Email Arrived At", "Payload Type", "Ticket Type", "Subject Line", "CC Field Data", "Actionable?",
                 "Assigned Owner", "Target Queue", "Responsibility",
                 "Tournament Evaluation Reasoning", "Processed At"
             ]
             return df
     except Exception as e:
-        st.error(f"Database Read Error: {e}")
+        # If the column doesn't exist yet, it means the user hasn't wiped the DB.
+        st.sidebar.error("Database Schema Mismatch! Please click 'Wipe Database' below.")
         return pd.DataFrame()
 
 def load_live_workloads():
-    """Reads the current active workload tracking counts from disk for team visibility."""
+    """Reads the current active workload tracking counts from disk."""
     if not os.path.exists(WORKLOAD_FILE):
         return {}
     try:
@@ -44,113 +46,202 @@ def load_live_workloads():
 
 def clear_ticket_history():
     """Wipes the database cleanly and deletes the workload tracking ledger."""
-    # 1. Clear database entries
     if os.path.exists(DB_FILE):
         try:
             with closing(sqlite3.connect(DB_FILE)) as conn:
                 with conn:
-                    conn.execute("DELETE FROM triaged_tickets")
-            st.success("Triage database wiped clean!")
+                    conn.execute("DROP TABLE IF EXISTS triaged_tickets")
+            st.sidebar.success("Database wiped clean!")
         except Exception as e:
-            st.error(f"Error clearing database: {e}")
+            st.sidebar.error(f"Error clearing database: {e}")
 
-    # 2. Obliterate the workload tracker so it resets completely to zero on next ticket
     if os.path.exists(WORKLOAD_FILE):
         try:
             os.remove(WORKLOAD_FILE)
-            st.toast("Workload tracking file successfully reset to zero!", icon="🔄")
         except Exception as e:
-            st.error(f"Error deleting workload file: {e}")
+            st.sidebar.error(f"Error deleting workload file: {e}")
 
 # --- Streamlit UI Configurations ---
-st.set_page_config(page_title="Real-Time IT AI Dispatcher Dashboard", layout="wide")
-st.title("🤖 Orchestrated IT Dispatcher Dashboard")
-st.markdown("Monitor real-time IT routing decisions and workload balances processed by your background AI Engine.")
+st.set_page_config(page_title="AI IT Dispatcher", layout="wide", initial_sidebar_state="expanded")
 
-# Load backend datasets
+st.markdown("""
+    <style>
+    .stDataFrame { border-radius: 8px;}
+    </style>
+""", unsafe_allow_html=True)
+
+# Load backend datasets once per rerun
 df_tickets = load_triaged_tickets()
 workloads_dict = load_live_workloads()
 
 # -------------------------------------------------------------------------
-# STAGE 1: GLOBAL METRICS BLOCK
+# SIDEBAR NAVIGATION & CONTROLS
 # -------------------------------------------------------------------------
-if not df_tickets.empty:
-    total_processed = len(df_tickets)
-    actionable_count = len(df_tickets[df_tickets["Actionable?"] == "✅ Yes"])
-    unassigned_count = len(df_tickets[df_tickets["Assigned Owner"] == "Unassigned"])
+st.sidebar.title("🤖 AI Dispatcher")
+st.sidebar.markdown("Autonomous Routing Console")
+st.sidebar.write("---")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Tickets Triaged", total_processed)
-    c2.metric("Actionable Tickets Routed", actionable_count)
-    c3.metric("Failed / Unassigned / Spammed", unassigned_count)
-else:
-    st.info("Waiting for the background AI Engine to process some emails... Make sure engine.py is running in your terminal!")
+# The Menu
+menu = st.sidebar.radio(
+    "Navigation Menu",
+    ["📋 Tickets Table", "📊 Team Workload", "📈 Analysis & Insights"]
+)
+
+st.sidebar.write("---")
+st.sidebar.markdown("**System Controls**")
+
+if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+    st.rerun()
+
+if st.sidebar.button("🗑️ Wipe Database", type="primary", use_container_width=True):
+    clear_ticket_history()
+    st.rerun()
 
 # -------------------------------------------------------------------------
-# STAGE 2: LIVE TEAM WORKLOAD LEDGER (NEW PROTOCOL ADDITION)
+# 📥 DATA EXPORT MODULE (NEW)
 # -------------------------------------------------------------------------
-st.write("---")
-st.subheader("📊 Live IT Staff Workload Status")
+st.sidebar.write("---")
+st.sidebar.markdown("**📥 Data Export**")
 
-if workloads_dict:
-    # Convert workload dictionary into a clean sorted dataframe for rendering
-    df_workloads = pd.DataFrame(
-        list(workloads_dict.items()),
-        columns=["IT Staff Member", "Active Ticket Count"]
-    ).sort_values(by="Active Ticket Count", ascending=True)
+if not df_tickets.empty and "Email Arrived At" in df_tickets.columns:
+    # Convert string dates to pandas datetime objects for filtering
+    df_tickets['Email Arrived At'] = pd.to_datetime(df_tickets['Email Arrived At'], errors='coerce')
 
-    # Split display into a beautiful side-by-side metric grid and bar chart visualization
-    wl_col1, wl_col2 = st.columns([2, 3])
+    valid_dates = df_tickets['Email Arrived At'].dropna()
 
-    with wl_col1:
-        st.markdown("**Current Ticket Distribution Matrix:**")
-        # Display individual staff counts in neat columns
-        sub_cols = st.columns(min(len(df_workloads), 4))
-        for idx, row in enumerate(df_workloads.itertuples()):
-            col_target = sub_cols[idx % len(sub_cols)]
-            col_target.metric(label=f"👤 {row._1}", value=f"{row._2} Active")
+    if not valid_dates.empty:
+        min_date = valid_dates.min().date()
+        max_date = valid_dates.max().date()
 
-    with wl_col2:
-        # Show a clean horizontal bar chart displaying who is handling the heavy lifting
-        st.bar_chart(
-            df_workloads,
-            x="IT Staff Member",
-            y="Active Ticket Count",
-            color="#4CAF50",
-            use_container_width=True
+        # Render the Date Range Picker
+        date_range = st.sidebar.date_input(
+            "Select Date Range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date
         )
-else:
-    st.caption("No team workloads tracked yet. The workload ledger will automatically generate when the first valid ticket is routed.")
 
-# -------------------------------------------------------------------------
-# STAGE 3: DASHBOARD CONTROLS
-# -------------------------------------------------------------------------
-st.write("---")
-col1, col2 = st.columns([1, 4])
-with col1:
-    if st.button("Manual Refresh Data", type="primary", use_container_width=True):
-        st.rerun()
-with col2:
-    if st.button("Wipe DB and Clear History", use_container_width=True):
-        clear_ticket_history()
-        st.rerun()
+        # Ensure the user has selected both a start and end date
+        if len(date_range) == 2:
+            start_date, end_date = date_range
 
-# -------------------------------------------------------------------------
-# STAGE 4: LIVE DISPATCH REGISTRY
-# -------------------------------------------------------------------------
-st.subheader("📋 Live Routing Registry")
-table_placeholder = st.empty()
+            # Filter the dataframe
+            mask = (df_tickets['Email Arrived At'].dt.date >= start_date) & (df_tickets['Email Arrived At'].dt.date <= end_date)
+            filtered_df = df_tickets.loc[mask]
 
-if not df_tickets.empty:
-    table_placeholder.dataframe(
-        df_tickets,
-        use_container_width=True,
-        column_config={
-            "Tournament Evaluation Reasoning": st.column_config.TextColumn(
-                "Tournament Evaluation Reasoning",
-                width="large"
+            # Convert to CSV format
+            csv_data = filtered_df.to_csv(index=False).encode('utf-8')
+
+            # Render the Download Button
+            st.sidebar.download_button(
+                label=f"⬇️ Download {len(filtered_df)} Tickets",
+                data=csv_data,
+                file_name=f"AIT_Tickets_{start_date}_to_{end_date}.csv",
+                mime="text/csv",
+                type="primary",
+                use_container_width=True
             )
-        }
-    )
 else:
-    table_placeholder.info("No ticket history records found.")
+    st.sidebar.info("No data available to export yet.")
+
+# -------------------------------------------------------------------------
+# MENU 1: TICKETS TABLE (Simplified)
+# -------------------------------------------------------------------------
+if menu == "📋 Tickets Table":
+    st.title("Live Routing Registry")
+    st.markdown("All processed tickets and their assigned routing.")
+
+    if not df_tickets.empty:
+        # UPDATED: Added "Email Arrived At" to the front of the table
+        display_cols = ["Email Arrived At", "Processed At", "Assigned Owner", "Ticket Type", "Responsibility", "Subject Line", "Target Queue"]
+        valid_display_cols = [col for col in display_cols if col in df_tickets.columns]
+
+        # Display the simple table
+        st.dataframe(
+            df_tickets[valid_display_cols],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No ticket history records found. Ensure engine.py is running.")
+
+# -------------------------------------------------------------------------
+# MENU 2: TEAM WORKLOAD
+# -------------------------------------------------------------------------
+elif menu == "📊 Team Workload":
+    st.title("Team Workload Ledger")
+    st.markdown("Live tracker of active tickets assigned to each IT staff member.")
+
+    if workloads_dict:
+        # Convert dictionary to dataframe for nice charting
+        df_workload = pd.DataFrame(list(workloads_dict.items()), columns=['Staff Member', 'Active Tickets'])
+        df_workload = df_workload.sort_values(by='Active Tickets', ascending=True)
+
+        col1, col2 = st.columns([1, 2])
+
+        with col1:
+            st.dataframe(df_workload, hide_index=True, use_container_width=True)
+
+        with col2:
+            fig = px.bar(
+                df_workload,
+                x='Active Tickets',
+                y='Staff Member',
+                orientation='h',
+                title="Current Ticket Distribution",
+                color='Active Tickets',
+                color_continuous_scale="Reds"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No workloads tracked yet.")
+
+# -------------------------------------------------------------------------
+# MENU 3: ANALYSIS & INSIGHTS
+# -------------------------------------------------------------------------
+elif menu == "📈 Analysis & Insights":
+    st.title("AI System Analytics")
+    st.markdown("Insights into ticket volumes, AI categorization, and queue distribution.")
+
+    if not df_tickets.empty:
+        # Top-level metrics
+        total_processed = len(df_tickets)
+        actionable_count = len(df_tickets[df_tickets["Actionable?"] == "✅ Yes"])
+        spam_count = len(df_tickets[df_tickets["Actionable?"] == "❌ No"])
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Emails Processed", total_processed)
+        c2.metric("Valid IT Requests", actionable_count)
+        c3.metric("Spam / Automated Rejected", spam_count)
+
+        st.write("---")
+
+        col_chart1, col_chart2 = st.columns(2)
+
+        with col_chart1:
+            # Donut chart for Ticket Types
+            type_counts = df_tickets["Ticket Type"].value_counts().reset_index()
+            type_counts.columns = ["Ticket Type", "Count"]
+            fig_type = px.pie(
+                type_counts,
+                names="Ticket Type",
+                values="Count",
+                hole=0.4,
+                title="Distribution of Ticket Types"
+            )
+            st.plotly_chart(fig_type, use_container_width=True)
+
+        with col_chart2:
+            # Bar chart for Target Queues
+            queue_counts = df_tickets[df_tickets["Target Queue"] != "Unassigned"]["Target Queue"].value_counts().reset_index()
+            queue_counts.columns = ["Target Queue", "Count"]
+            fig_queue = px.bar(
+                queue_counts,
+                x="Target Queue",
+                y="Count",
+                title="Tickets by Department Queue",
+                color="Target Queue"
+            )
+            st.plotly_chart(fig_queue, use_container_width=True)
+    else:
+        st.info("Not enough data to generate analytics. Process some tickets first!")
