@@ -8,5 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+.env
 tickets.db
 workloads.json
