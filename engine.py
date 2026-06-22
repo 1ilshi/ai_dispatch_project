@@ -11,7 +11,7 @@ import re
 from contextlib import closing
 from email.header import decode_header
 from typing import List, Dict, Any
-from email.utils import parsedate_to_datetime  # <-- ADDED DATE IMPORT
+from email.utils import parsedate_to_datetime
 
 import pandas as pd
 import requests
@@ -45,7 +45,7 @@ def init_db():
             conn.execute("""
                          CREATE TABLE IF NOT EXISTS triaged_tickets (
                                                                         email_id TEXT PRIMARY KEY,
-                                                                        email_date DATETIME,  -- <-- ADDED COLUMN
+                                                                        email_date DATETIME,
                                                                         payload_type TEXT,
                                                                         ticket_type TEXT,
                                                                         subject TEXT,
@@ -88,14 +88,29 @@ def load_relational_maps(filepath: str = MATRIX_FILE) -> tuple:
             )
             allowed_types_list = '   - "Problem Solving"\n   - "New Installation"\n   - "Provide Guide/Advise"\n   - "Special Request"'
 
+        # 📚 DYNAMIC ACRONYM GLOSSARY LOADER
+        try:
+            acronyms_df = pd.read_excel(filepath, sheet_name="Acronyms", header=None)
+            if str(acronyms_df.iloc[0, 0]).strip().lower() in ["acronym", "abbr", "abbreviation"]:
+                acronyms_df = acronyms_df.iloc[1:].reset_index(drop=True)
+            acronyms_df = acronyms_df.dropna(subset=[acronyms_df.columns[0]])
+
+            acronyms_list = [f"- {str(row[acronyms_df.columns[0]]).strip()}: {str(row[acronyms_df.columns[1]]).strip()}" for _, row in acronyms_df.iterrows()]
+            acronyms_markdown = "\n".join(acronyms_list)
+            if not acronyms_markdown:
+                acronyms_markdown = "No acronyms loaded."
+        except Exception as e:
+            logger.warning(f"Could not load 'Acronyms' sheet (or it doesn't exist yet). Error: {e}")
+            acronyms_markdown = "No custom acronyms defined yet."
+
         skills_markdown = skills_df.to_markdown(index=False)
         skill_to_queue = dict(zip(queue_df['Unique_Skill'], queue_df['Queue']))
         skill_to_owners = roster_df.groupby('Unique_Skill')['Owner'].apply(lambda x: list(x.astype(str))).to_dict()
 
-        return skills_markdown, skill_to_queue, skill_to_owners, ticket_types_markdown, allowed_types_list
+        return skills_markdown, skill_to_queue, skill_to_owners, ticket_types_markdown, allowed_types_list, acronyms_markdown
     except Exception as e:
         logger.error(f"Error loading relational maps: {e}")
-        return None, {}, {}, "", ""
+        return None, {}, {}, "", "", ""
 
 def load_or_init_workloads(filepath: str = MATRIX_FILE) -> dict:
     if os.path.exists(WORKLOAD_FILE):
@@ -165,7 +180,6 @@ def fetch_unread_emails() -> List[Dict[str, Any]]:
                         subject, encoding = decode_header(msg.get("Subject", ""))[0]
                         if isinstance(subject, bytes): subject = subject.decode(encoding if encoding else "utf-8")
 
-                        # --- ADDED: EXTRACT DATE ---
                         date_header = msg.get("Date")
                         email_date = time.strftime("%Y-%m-%d %H:%M:%S")
                         if date_header:
@@ -173,7 +187,6 @@ def fetch_unread_emails() -> List[Dict[str, Any]]:
                                 email_date = parsedate_to_datetime(date_header).strftime("%Y-%m-%d %H:%M:%S")
                             except Exception as e:
                                 logger.warning(f"Could not parse email date: {e}")
-                        # ---------------------------
 
                         cc_header = msg.get("Cc", "")
                         cc_list = ""
@@ -193,7 +206,7 @@ def fetch_unread_emails() -> List[Dict[str, Any]]:
                             body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
 
                         unprocessed_emails.append({
-                            "email_id": email_id_str, "email_date": email_date,  # <-- ADDED DATE
+                            "email_id": email_id_str, "email_date": email_date,
                             "subject": subject if subject else "(No Subject)",
                             "cc": cc_list, "body": body[:1500], "images": images_b64
                         })
@@ -241,7 +254,7 @@ def stage1_gatekeeper(subject: str, body: str) -> dict:
         logger.error(f"Stage 1 Error: {e}")
         return {"is_valid_request": False, "reason": "Engine Failure"}
 
-def stage2_skill_router(subject: str, body: str, skill_dict: str, types_markdown: str, allowed_types_list: str) -> tuple:
+def stage2_skill_router(subject: str, body: str, skill_dict: str, types_markdown: str, allowed_types_list: str, acronyms_markdown: str) -> tuple:
     """Classifies ticket type and assigns the handling responsibility."""
     logger.info("STAGE 2: Skill Classification (llama3.1)...")
 
@@ -249,6 +262,7 @@ def stage2_skill_router(subject: str, body: str, skill_dict: str, types_markdown
               .replace("{skill_dictionary}", str(skill_dict))
               .replace("{ticket_types_dictionary}", str(types_markdown))
               .replace("{allowed_ticket_types}", str(allowed_types_list))
+              .replace("{acronyms_dictionary}", str(acronyms_markdown))
               .replace("{subject}", str(subject))
               .replace("{body}", str(body[:1000])))
 
@@ -283,7 +297,7 @@ def stage2_skill_router(subject: str, body: str, skill_dict: str, types_markdown
 
 def run_dispatch_cycle():
     logger.info("Starting dispatch cycle...")
-    skills_markdown, skill_to_queue, skill_to_owners, types_markdown, allowed_types_list = load_relational_maps()
+    skills_markdown, skill_to_queue, skill_to_owners, types_markdown, allowed_types_list, acronyms_markdown = load_relational_maps()
 
     if not skill_to_queue:
         logger.error("Failed to load Excel data. Aborting.")
@@ -319,7 +333,8 @@ def run_dispatch_cycle():
                 full_context,
                 skills_markdown,
                 types_markdown,
-                allowed_types_list
+                allowed_types_list,
+                acronyms_markdown  # <-- ADDED ACRONYMS HERE
             )
             # PURE PYTHON: Relational Lookup
             queue = skill_to_queue.get(responsibility, "Unassigned")
@@ -354,7 +369,7 @@ def run_dispatch_cycle():
 
         ticket_packet = {
             "email_id": em["email_id"],
-            "email_date": em["email_date"],  # <-- ADDED DATE TO PACKET
+            "email_date": em["email_date"],
             "payload_type": "🖼️ Image+Text" if em["images"] else "📝 Pure Text",
             "ticket_type": ticket_type,
             "subject": em["subject"],

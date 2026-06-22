@@ -38,6 +38,10 @@ STAGE2_SKILL_ROUTER_PROMPT = """
 You are a highly precise IT service classifier.
 Based on the IT request below, you must match the user's issue to exactly ONE skill from the skill dictionary, and categorize it using the ticket types dictionary provided.
 
+<ACRONYMS_DICTIONARY>
+{acronyms_dictionary}
+</ACRONYMS_DICTIONARY>
+
 <TICKET_TYPES_DICTIONARY>
 {ticket_types_dictionary}
 </TICKET_TYPES_DICTIONARY>
@@ -65,10 +69,11 @@ IF SYSTEM IS ANY OTHER INTERNAL SYSTEM: Route to that specific system’s skill 
 
 IF NO SYSTEM IS NAMED OR SYSTEM IS GENERAL: Only then route to 'User account' for general password resets, master account locks, or identity issues.
 
-CRITICAL: Do NOT route functional system-specific requests to 'User account' just because the user mentions a password or login. 'User account' is reserved for general, platform-agnostic identity and credential management.5. SENIOR ESCALATION (General_ Guardrail): Any skill prefixed with 'General_' routes directly to Tier-3 Senior Engineers. NEVER select a 'General_' skill if a specific system or task skill exists. You MUST actively search for the specific task skill first.
+CRITICAL: Do NOT route functional system-specific requests to 'User account' just because the user mentions a password or login. 'User account' is reserved for general, platform-agnostic identity and credential management.
+5. SENIOR ESCALATION (General_ Guardrail): Any skill prefixed with 'General_' routes directly to Tier-3 Senior Engineers. NEVER select a 'General_' skill if a specific system or task skill exists. You MUST actively search for the specific task skill first.
 6. EXACT MATCHING: Pick the single most appropriate skill from the 'Unique_Skill' column in the dictionary above. You are encouraged to use the 'INCLUDES' and 'KEYWORDS' lists to find the perfect match.
 7. SENDER CONTEXT FILTER: For generic requests like "forms" or "portals", look at the sender's office. If the sender's department has zero relation to a restricted queue's domain, that queue is an automatic mismatch.
-8. UNKNOWN ACRONYMS: Never guess unfamiliar systems or acronyms by lettering. Instead, infer intent from the overall context and action verbs (e.g., "need access" implies Access Management, "error screen" implies Troubleshooting) and map the skill based on semantic meaning.
+8. DECODING ACRONYMS: Before routing, check the <ACRONYMS_DICTIONARY> to translate any university-specific clubs, departments, or buildings mentioned in the email. Once you know what the acronym means, map the skill based on that semantic context. Never guess unfamiliar systems by lettering.
 9. INTENT OVER NOISE: Ignore email thread artifacts like 'AutoReply', 'Re:', 'Fwd:', or system ticket IDs in the subject. Do NOT route to Email categories just because these words exist. Focus entirely on the core hardware/software issue in the body. If the subject is empty or just "Fwd:", base your routing 100% on the body text.
 
 OUTPUT SPECIFICATION:
